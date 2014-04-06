@@ -131,7 +131,10 @@ abstract class SlickRetrieveDelegate
       }
     }
     session.close()
-    ret(t)
+    t match {
+      case Success(e) => return e
+      case Failure(e) => throw new IndexOutOfBoundsException(e.getMessage)
+    }
   }
 
   override def indexOfId(itemId: IDTYPE, columns: Array[AnyRef], ascending: Array[Boolean], condition: ConditionMap): Int = {
