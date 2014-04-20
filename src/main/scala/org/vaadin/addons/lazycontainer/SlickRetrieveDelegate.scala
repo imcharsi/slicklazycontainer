@@ -1,153 +1,261 @@
 package org.vaadin.addons.lazycontainer
 
 import scala.slick.driver.JdbcDriver
-import scala.util.{Failure, Success, Try}
+import scala.util.{Failure, Try, Success}
+import scala.slick.lifted.CompiledFunction
+import scala.ref.WeakReference
+import java._
 import scala.collection.JavaConversions
-import scala.slick.lifted.{AppliedCompiledFunction, CompiledFunction}
-
 
 /**
- * Created by i on 14. 1. 20.
+ * Created by KangWoo,Lee on 14. 4. 20.
  */
-abstract class SlickRetrieveDelegate
-[IDTYPE, BEANTYPE, TABLETYPES, ENTITYTYPES, DRIVER <: JdbcDriver]
-(val driver: DRIVER) extends RetrieveDelegate[IDTYPE, BEANTYPE] {
+abstract class SlickRetrieveDelegate[Drv <: JdbcDriver, I <: AnyRef, D](val drv: Drv) extends RetrieveDelegate[I, D] {
 
-  import driver.simple._
+  import drv.simple._
 
-  /**
-   * TODO
-   * 한가지 문제가 있다.
-   * compiled 에서는 order by 를 인자화할 수 없다.
-   * 차선책으로 정렬조건을 바꿀때마다 compile 을 새로 하는 수밖에 없다.
-   * 주어진 정렬조건이 앞의 정렬조건과 다르다는 것을 어떻게 알 수 있나.
-   * 편리하고 확실하게 알 수 있는 방법은 없는 듯한데,
-   * 사용자가 정렬조건을 바꿀때 명시적으로 다시 compile 하도록 하자.
-   * 이를 위한 method 가 또 필요하다. 예를 들면 def compile() 와 같이 하면 되겠다.
-   * 아니다. compile 되면 어떤 방식으로도 아무것도 바꿀수 없다.
-   * 정렬조건도 마찬가지이다. 그래서 그냥 매번 새로 번역하도록 해야 한다.
-   * 비용이 많이 들듯 하다.
-   */
-  type ListQuery = Query[TABLETYPES, ENTITYTYPES]
-  type IdIdxQuery = Query[(Column[IDTYPE], Column[Long]), (IDTYPE, Long)]
-  type IdQuery = Query[Column[IDTYPE], IDTYPE]
-  type IdxQuery = Query[Column[Long], Long]
-  type ConditionMap = java.util.Map[AnyRef, AnyRef]
+  type BasicColumnParameterType = (ConstColumn[Long], ConstColumn[Long], Column[Option[Int]], Column[I])
+  type BasicParameterType = (Long, Long, Option[Int], I)
+  type ExtraColumnParameterType
+  type ExtraParameterType
+  type ColumnParameterType = (BasicColumnParameterType, ExtraColumnParameterType)
+  type ParameterType = (BasicParameterType, ExtraParameterType)
+  type TableType
+  type DomainType
+  type ConditionQuery = Query[TableType, DomainType, Seq]
+  type RowNumberQuery = Query[(Column[Option[Int]], Column[I]), (Option[Int], I), Seq]
+  type GetIdsQuery = Query[Column[I], I, Seq]
+  type ListCompiledQuery = CompiledFunction[_, _, ParameterType, _, Seq[DomainType]]
+  type SizeCompiledQuery = CompiledFunction[_, _, ParameterType, _, Int]
+  type RowNumberCompiledQuery = CompiledFunction[_, _, ParameterType, _, Seq[(Option[Int], I)]]
+  type GetIdsCompiledQuery = CompiledFunction[_, _, ParameterType, _, Seq[I]]
 
-  def compareId(col: Column[IDTYPE], id: IDTYPE): Column[Option[Boolean]]
+  // cached-compiled-query
+  private var sizeCompiledQuery: Option[SizeCompiledQuery] = None
+  private var listCompiledQuery: Option[ListCompiledQuery] = None
+  private var indexOfIdCompiledQuery: Option[RowNumberCompiledQuery] = None
+  private var getIdByIndexCompiledQuery: Option[RowNumberCompiledQuery] = None
+  private var getIdsCompiledQuery: Option[GetIdsCompiledQuery] = None
+  // there must be row_number window function in dbms.
+  private val row_number = SimpleFunction.nullary[Option[Int]]("row_number")
+  // for skip getIdByIndex
+  private var enableGetIdByIndex: Try[Unit] = Success()
+  // for auto cache-refresh
+  private var columnsRef: WeakReference[Array[AnyRef]] = new WeakReference[Array[AnyRef]](null)
+  private var ascendingRef: WeakReference[Array[Boolean]] = new WeakReference[Array[Boolean]](null)
 
-  def id(t: TABLETYPES): Column[IDTYPE]
+  // util
 
-  def applyCondition(condition: ConditionMap): ListQuery
-
-  def session(): Session
-
-  def modifier(a: ENTITYTYPES): BEANTYPE
-
-  def sortBy(t: TABLETYPES, columns: Array[AnyRef], ascending: Array[Boolean]): scala.slick.lifted.Ordered
-
-  def idx2id(query: IdIdxQuery, index: Int): IdQuery =
-    for {
-      (id, idx) <- query if idx === index.toLong
-    } yield id
-
-  def id2idx(query: IdIdxQuery, i: IDTYPE): IdxQuery =
-    for {
-      (id, idx) <- query if compareId(id, i)
-    } yield idx
-
-  private val row_number = SimpleFunction.nullary[Long]("row_number")
-
-  def numbering(query: ListQuery, columns: Array[AnyRef], ascending: Array[Boolean]): IdIdxQuery = {
-    query.map {
-      case t => (id(t), ((row_number :: Over.orderBy(sortBy(t, columns, ascending))) - 1l))
-    }.asInstanceOf[IdIdxQuery]
+  private def ret[A](t: Try[A]): A = t match {
+    case Success(s) => s
+    case Failure(e) => throw e
   }
 
-  def pickId(query: ListQuery): IdQuery =
-    for {
-      t <- query
-    } yield id(t)
-
-  def ret[T](t: Try[T]): T = {
-    t match {
-      case Success(s) => {
-        return s
-      }
-      case Failure(e) => {
-        throw e
-      }
-    }
+  private def checkCacheClearingRequired(columns: Array[AnyRef], ascending: Array[Boolean]): Unit = {
+    def comp(a: (Option[_], Option[_])): Boolean = a._1 != a._2
+    // here, WeakReference is used for auto cache-refresh. Is this ok?
+    val p1 = Option(columns).map(_.toList)
+    val p2 = columnsRef.get.map(_.toList)
+    val q1 = Option(ascending).map(_.toList)
+    val q2 = ascendingRef.get.map(_.toList)
+    ((p1, p2) ::(q1, q2) :: Nil).
+      find(comp).
+      map(_ => clearCompiledQuery()).
+      map(_ => columnsRef = new WeakReference[Array[AnyRef]](columns)).
+      map(_ => ascendingRef = new WeakReference[Array[Boolean]](ascending))
   }
 
-  override def size(condition: ConditionMap): Int = {
-    implicit val session = this.session()
-    import session.withTransaction
-    val t = Try {
-      withTransaction {
-        applyCondition(condition).length.run
-      }
+  private def innerGetIdByIndex(index: Int, columns: Array[AnyRef], ascending: Array[Boolean], condition: util.Map[AnyRef, AnyRef]): AnyRef = {
+    checkCacheClearingRequired(columns, ascending)
+    if (getIdByIndexCompiledQuery.isEmpty)
+      refreshGetIdByIndexQuery(columns, ascending)
+    implicit val s = createSession()
+    val r = Try {
+      getIdByIndexCompiledQuery.
+        map(_.apply((-1L, -1L, Option(index), nullId), prepareParameter(condition))).
+        map(_.run)
     }
-    session.close()
-    ret(t)
+    s.close()
+    ret(r).
+      filter(!_.isEmpty).
+      map(_.head._2).
+      getOrElse(nullId)
   }
 
-  override def getIds(columns: Array[AnyRef], ascending: Array[Boolean], condition: ConditionMap): java.util.Collection[IDTYPE] = {
-    implicit val session = this.session()
-    import session.withTransaction
-    val t = Try {
-      withTransaction {
-        val r = pickId(applyCondition(condition).sortBy(sortBy(_, columns, ascending)))
-        JavaConversions.seqAsJavaList(r.list())
-      }
-    }
-    session.close()
-    ret(t)
+  // customize
+
+  protected def prepareCondition(p: ColumnParameterType): ConditionQuery
+
+  protected def prepareParameter(condition: util.Map[AnyRef, AnyRef]): ExtraParameterType
+
+  protected def prepareOrdered(t: TableType, columns: Array[AnyRef], ascending: Array[Boolean]): slick.lifted.Ordered
+
+  protected def compare(a: Column[I], b: Column[I]): Column[Option[Boolean]]
+
+  protected def idColumn(t: TableType): Column[I]
+
+  protected def nullId: I
+
+  protected def modifier(x: DomainType): D
+
+  protected def createSession(): Session
+
+  // prepare
+
+  private def prepareRowNumber(columns: Array[AnyRef], ascending: Array[Boolean])(p: ColumnParameterType) = {
+    prepareCondition(p).map {
+      case t ⇒ (row_number :: Over.orderBy(prepareOrdered(t, columns, ascending)), idColumn(t))
+    }.asInstanceOf[RowNumberQuery]
   }
 
-  override def getList(startIndex: Int, numberOfItems: Int, columns: Array[AnyRef], ascending: Array[Boolean], condition: ConditionMap): java.util.List[BEANTYPE] = {
-    implicit val session = this.session()
-    import session.withTransaction
-    val t = Try {
-      withTransaction {
-        val r = applyCondition(condition).sortBy(sortBy(_, columns, ascending))
-        val r2 = r.drop(startIndex).take(numberOfItems).list()
-        val r3 = r2.map(modifier)
-        JavaConversions.seqAsJavaList(r3)
-      }
-    }
-    session.close()
-    ret(t)
-  }
-
-  override def getIdByIndex(index: Int, columns: Array[AnyRef], ascending: Array[Boolean], condition: ConditionMap): AnyRef = {
-    implicit val session = this.session()
-    import session.withTransaction
-    val t = Try {
-      withTransaction {
-        val r = numbering(applyCondition(condition), columns, ascending)
-        val r2 = idx2id(r, index)
-        r2.first().asInstanceOf[AnyRef]
-      }
-    }
-    session.close()
-    t match {
-      case Success(e) => return e
-      case Failure(e) => throw new IndexOutOfBoundsException(e.getMessage)
+  protected def prepareIndexOfId(columns: Array[AnyRef], ascending: Array[Boolean])(p: ColumnParameterType): RowNumberQuery = {
+    val ((_, _, _, idParam), _) = p
+    prepareRowNumber(columns, ascending)(p).filter {
+      case (row_num, id) ⇒ compare(id, idParam)
     }
   }
 
-  override def indexOfId(itemId: IDTYPE, columns: Array[AnyRef], ascending: Array[Boolean], condition: ConditionMap): Int = {
-    implicit val session = this.session()
-    import session.withTransaction
-    val t = Try {
-      withTransaction {
-        val r = numbering(applyCondition(condition), columns, ascending)
-        val r2 = id2idx(r, itemId)
-        r2.first().toInt
-      }
+  protected def prepareGetIdByIndex(columns: Array[AnyRef], ascending: Array[Boolean])(p: ColumnParameterType): RowNumberQuery = {
+    val ((_, _, idx, _), _) = p
+    prepareRowNumber(columns, ascending)(p).filter {
+      case (row_num, id) ⇒ row_num === idx
     }
-    session.close()
-    ret(t)
+  }
+
+  protected def prepareSize(p: ColumnParameterType): Column[Int] = prepareCondition(p).length
+
+  protected def prepareList(columns: Array[AnyRef], ascending: Array[Boolean])(p: ColumnParameterType): ConditionQuery = {
+    prepareCondition(p).
+      sortBy(prepareOrdered(_, columns, ascending)).
+      drop(p._1._1).
+      take(p._1._2)
+  }
+
+  protected def prepareGetIds(columns: Array[AnyRef], ascending: Array[Boolean])(p: ColumnParameterType): GetIdsQuery = {
+    prepareCondition(p).
+      sortBy(prepareOrdered(_, columns, ascending)).
+      map(idColumn)
+  }
+
+  // compile
+
+  protected def compileSize(): SizeCompiledQuery // = Compiled(prepareSize _)
+
+  protected def compileList(columns: Array[AnyRef], ascending: Array[Boolean]): ListCompiledQuery // = Compiled(prepareList(columns, ascending) _)
+
+  protected def compileIndexOfId(columns: Array[AnyRef], ascending: Array[Boolean]): RowNumberCompiledQuery // = Compiled(prepareIndexOfId(columns, ascending) _)
+
+  protected def compileGetIdByIndex(columns: Array[AnyRef], ascending: Array[Boolean]): RowNumberCompiledQuery // = Compiled(prepareGetIdByIndex(columns, ascending) _)
+
+  protected def compileGetIds(columns: Array[AnyRef], ascending: Array[Boolean]): GetIdsCompiledQuery // = Compiled(prepareGetIds(columns, ascending) _)
+
+  // refresh
+
+  protected def refreshListQuery(columns: Array[AnyRef], ascending: Array[Boolean]): Unit = {
+    listCompiledQuery = Option[ListCompiledQuery](compileList(columns, ascending))
+  }
+
+  protected def refreshIndexOfIdQuery(columns: Array[AnyRef], ascending: Array[Boolean]): Unit = {
+    indexOfIdCompiledQuery = Option[RowNumberCompiledQuery](compileIndexOfId(columns, ascending))
+  }
+
+  protected def refreshGetIdByIndexQuery(columns: Array[AnyRef], ascending: Array[Boolean]): Unit = {
+    getIdByIndexCompiledQuery = Option[RowNumberCompiledQuery](compileGetIdByIndex(columns, ascending))
+  }
+
+  protected def refreshGetIdsQuery(columns: Array[AnyRef], ascending: Array[Boolean]): Unit = {
+    getIdsCompiledQuery = Option[GetIdsCompiledQuery](compileGetIds(columns, ascending))
+  }
+
+  protected def refreshSizeQuery(): Unit = {
+    sizeCompiledQuery = Option[SizeCompiledQuery](compileSize())
+  }
+
+  // public api
+
+  def clearCompiledQuery(): Unit = {
+    listCompiledQuery = None
+    indexOfIdCompiledQuery = None
+    getIdByIndexCompiledQuery = None
+    getIdsCompiledQuery = None
+  }
+
+  def useGetIdByIndex(b: Boolean = true): Unit = {
+    if (b)
+      enableGetIdByIndex = Success()
+    else
+      enableGetIdByIndex = Failure(new IndexOutOfBoundsException)
+  }
+
+  override def indexOfId(itemId: I, columns: Array[AnyRef], ascending: Array[Boolean], condition: util.Map[AnyRef, AnyRef]): Int = {
+    checkCacheClearingRequired(columns, ascending)
+    if (indexOfIdCompiledQuery.isEmpty)
+      refreshIndexOfIdQuery(columns, ascending)
+    implicit val s = createSession()
+    val r = Try {
+      indexOfIdCompiledQuery.
+        map(_.apply((-1L, -1L, None, itemId), prepareParameter(condition))).
+        map(_.run)
+    }
+    s.close()
+    ret(r).
+      filter(!_.isEmpty).
+      flatMap(_.head._1).
+      getOrElse(-1)
+  }
+
+  override def getList(startIndex: Int, numberOfItems: Int, columns: Array[AnyRef], ascending: Array[Boolean], condition: util.Map[AnyRef, AnyRef]): util.List[D] = {
+    checkCacheClearingRequired(columns, ascending)
+    if (listCompiledQuery.isEmpty)
+      refreshListQuery(columns, ascending)
+    implicit val s = createSession()
+    val r = Try {
+      listCompiledQuery.
+        map(_.apply((startIndex, numberOfItems, None, nullId), prepareParameter(condition))).
+        map(_.run)
+    }
+    s.close()
+    ret(r).
+      map(_.map(modifier)).
+      map(JavaConversions.seqAsJavaList).get
+  }
+
+
+  override def getIdByIndex(index: Int, columns: Array[AnyRef], ascending: Array[Boolean], condition: util.Map[AnyRef, AnyRef]): AnyRef = {
+    /**
+     * in sometimes, getIdByIndex can causes overhead.
+     * so when sql-execution is not required, skip it.
+     */
+    enableGetIdByIndex.
+      map(_ => innerGetIdByIndex(index, columns, ascending, condition)).
+      get
+  }
+
+  override def getIds(columns: Array[AnyRef], ascending: Array[Boolean], condition: util.Map[AnyRef, AnyRef]): util.Collection[I] = {
+    checkCacheClearingRequired(columns, ascending)
+    if (getIdsCompiledQuery.isEmpty)
+      refreshGetIdsQuery(columns, ascending)
+    implicit val s = createSession()
+    val r = Try {
+      getIdsCompiledQuery.
+        map(_.apply((-1L, -1L, None, nullId), prepareParameter(condition))).
+        map(_.run)
+    }
+    s.close()
+    ret(r).
+      map(JavaConversions.seqAsJavaList).get
+  }
+
+  override def size(condition: util.Map[AnyRef, AnyRef]): Int = {
+    if (sizeCompiledQuery.isEmpty)
+      refreshSizeQuery()
+    implicit val s = createSession()
+    val r = Try {
+      sizeCompiledQuery.
+        map(_.apply((-1L, -1L, None, nullId), prepareParameter(condition))).
+        map(_.run)
+    }
+    s.close()
+    ret(r).get
   }
 }
